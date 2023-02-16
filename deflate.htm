@@ -1,0 +1,852 @@
+<style>
+    span {
+        font-family: 'MS Gothic';  
+    }
+</style>
+<body>
+    <span id="lblDisp"></span>
+</body>
+
+<script type="text/javascript">
+const DEBUG = false;
+let debugLog = "";
+
+const BLOCK_MAX_BUFFER_LEN = 131072;
+const REPEAT_LEN_MIN = 3;
+const FAST_INDEX_CHECK_MAX = 128;
+const FAST_INDEX_CHECK_MIN = 16;
+const FAST_REPEAT_LENGTH = 8;
+const CODELEN_VALUES = [
+    16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+];
+const LENGTH_EXTRA_BIT_BASE = [
+    3, 4, 5, 6, 7, 8, 9, 10, 11, 13,
+    15, 17, 19, 23, 27, 31, 35, 43, 51, 59,
+    67, 83, 99, 115, 131, 163, 195, 227, 258,
+];
+const LENGTH_EXTRA_BIT_LEN = [
+    0, 0, 0, 0, 0, 0, 0, 0, 1, 1,
+    1, 1, 2, 2, 2, 2, 3, 3, 3, 3,
+    4, 4, 4, 4, 5, 5, 5, 5, 0,
+];
+const DISTANCE_EXTRA_BIT_BASE = [
+    1, 2, 3, 4, 5, 7, 9, 13, 17, 25,
+    33, 49, 65, 97, 129, 193, 257, 385, 513, 769,
+    1025, 1537, 2049, 3073, 4097, 6145,
+    8193, 12289, 16385, 24577,
+];
+const DISTANCE_EXTRA_BIT_LEN = [
+    0, 0, 0, 0, 1, 1, 2, 2, 3, 3,
+    4, 4, 5, 5, 6, 6, 7, 7, 8, 8,
+    9, 9, 10, 10, 11, 11, 12, 12, 13, 13,
+];
+const BTYPE = Object.freeze({
+    UNCOMPRESSED: 0,
+    FIXED: 1,
+    DYNAMIC: 2,
+});
+
+class BitWriteStream {
+    /** @type{boolean} */
+    #isEnd = false;
+    /** @type{number} */
+    #nowBits = 0;
+    /**
+     * @param {Uint8Array} buffer 
+     * @param {number} bufferOffset 
+     * @param {number} bitsOffset 
+     */
+    constructor(buffer, bufferOffset = 0, bitsOffset = 0) {
+        /** @type{Uint8Array} */
+        this.buffer = buffer;
+        /** @type{number} */
+        this.bufferIndex = bufferOffset;
+        /** @type{number} */
+        this.nowBitsIndex = bitsOffset;
+        /** @type{number} */
+        this.#nowBits = buffer[bufferOffset];
+    }
+    /**
+     * @param {number} bit 
+     */
+    #write(bit) {
+        if (this.#isEnd) {
+            throw new Error('Lack of data length');
+        }
+        bit <<= this.nowBitsIndex;
+        this.#nowBits += bit;
+        this.nowBitsIndex++;
+        if (this.nowBitsIndex >= 8) {
+            this.buffer[this.bufferIndex] = this.#nowBits;
+            this.bufferIndex++;
+            this.#nowBits = 0;
+            this.nowBitsIndex = 0;
+            if (this.buffer.length <= this.bufferIndex) {
+                this.#isEnd = true;
+            }
+        }
+    }
+    /**
+     * @param {number} value 
+     * @param {number} length 
+     */
+    writeRange(value, length) {
+        let mask = 1;
+        let bit = 0;
+        for (let i = 0; i < length; i++) {
+            bit = (value & mask) ? 1 : 0;
+            this.#write(bit);
+            mask <<= 1;
+        }
+    }
+    /**
+     * @param {number} value 
+     * @param {number} length 
+     */
+    writeRangeCoded(value, length) {
+        let mask = 1 << (length - 1);
+        let bit = 0;
+        for (let i = 0; i < length; i++) {
+            bit = (value & mask) ? 1 : 0;
+            this.#write(bit);
+            mask >>>= 1;
+        }
+    }
+}
+
+class Simble {
+    /** @type{number} */
+    count = 0;
+    /** @type{number[]} */
+    simbles = [];
+    /**
+     * @param {number} count 
+     * @param {number[]} simbles 
+     */
+    constructor(count, simbles) {
+        this.count = count;
+        this.simbles = simbles;
+    }
+}
+
+function dump(arr, flat = false) {
+    let val16 = "";
+    let chr16 = "";
+    if (flat) {
+        for(let i=0; i<arr.length; i++) {
+            let v = arr[i];
+            let val = ("" + v).padStart(3, "0");
+            val16 += val + "<br/>";
+        }
+        return val16;
+    }
+    for(let i=0; i<arr.length; i++) {
+        let v = arr[i];
+        let val = v.toString(16).toUpperCase().padStart(2, "0");
+        let addr = i.toString(16).toUpperCase().padStart(4, "0");
+        let chr = (0x20 <= v && v <= 0x7F) ? String.fromCharCode(v) : "ä";
+        chr16 += chr;
+        switch(i%16) {
+        case 0:
+            val16 += addr + "　" + val + " ";
+            break;
+        case 3:
+        case 7:
+        case 11:
+            val16 += val + "　";
+            break;
+        case 15:
+            val16 += val + "　" + chr16 + "<br/>";
+            chr16 = "";
+            break;
+        default:
+            val16 += val + " ";
+            break;
+        }
+    }
+    return val16;
+}
+
+/**
+ * 
+ * @param {Uint8Array} input 
+ * @param {number} startIndex 
+ * @param {number} targetLength 
+ * @returns {number[]}
+ */
+function generateLZ77IndexMap(input, startIndex, targetLength) {
+    const end = startIndex + targetLength - REPEAT_LEN_MIN;
+    const indexMap = {};
+    for (let i = startIndex; i <= end; i++) {
+        const indexKey = input[i] << 16 | input[i + 1] << 8 | input[i + 2];
+        if (indexMap[indexKey] === undefined) {
+            indexMap[indexKey] = [];
+        }
+        indexMap[indexKey].push(i);
+    }
+    return indexMap;
+}
+/**
+ * 
+ * @param {Uint8Array} input 
+ * @param {number} startIndex 
+ * @param {number} targetLength 
+ * @returns {number[][]}
+ */
+function generateLZ77Codes(input, startIndex, targetLength) {
+    let nowIndex = startIndex;
+    const endIndex = startIndex + targetLength - REPEAT_LEN_MIN;
+    let slideIndexBase = 0;
+    let repeatLength = 0;
+    let repeatLengthMax = 0;
+    let repeatLengthMaxIndex = 0;
+    let distance = 0;
+    let repeatLengthCodeValue = 0;
+    let repeatDistanceCodeValue = 0;
+
+    const codeTargetValues = [];
+    const startIndexMap = {};
+    const endIndexMap = {};
+
+    const indexMap = generateLZ77IndexMap(input, startIndex, targetLength);
+    while (nowIndex <= endIndex) {
+        const indexKey = input[nowIndex] << 16 | input[nowIndex + 1] << 8 | input[nowIndex + 2];
+        const indexes = indexMap[indexKey];
+        if (indexes === undefined || indexes.length <= 1) {
+            codeTargetValues.push([input[nowIndex]]);
+            nowIndex++;
+            continue;
+        }
+
+        slideIndexBase = (nowIndex > 0x8000) ? nowIndex - 0x8000 : 0;
+        repeatLengthMax = 0;
+        repeatLengthMaxIndex = 0;
+        let skipindexes = startIndexMap[indexKey] || 0;
+        while (indexes[skipindexes] < slideIndexBase) {
+            skipindexes = (skipindexes + 1) | 0;
+        }
+        startIndexMap[indexKey] = skipindexes;
+        skipindexes = endIndexMap[indexKey] || 0;
+        while (indexes[skipindexes] < nowIndex) {
+            skipindexes = (skipindexes + 1) | 0;
+        }
+        endIndexMap[indexKey] = skipindexes;
+        let checkCount = 0;
+indexMapLoop:
+        for (let i = endIndexMap[indexKey] - 1, iMin = startIndexMap[indexKey]; iMin <= i; i--) {
+            if (checkCount >= FAST_INDEX_CHECK_MAX
+                || (repeatLengthMax >= FAST_REPEAT_LENGTH && checkCount >= FAST_INDEX_CHECK_MIN)) {
+                break;
+            }
+            checkCount++;
+            const index = indexes[i];
+            for (let j = repeatLengthMax - 1; 0 < j; j--) {
+                if (input[index + j] !== input[nowIndex + j]) {
+                    continue indexMapLoop;
+                }
+            }
+            repeatLength = 258;
+            for (let j = repeatLengthMax; j <= 258; j++) {
+                if (input[index + j] !== input[nowIndex + j]) {
+                    repeatLength = j;
+                    break;
+                }
+            }
+            if (repeatLengthMax < repeatLength) {
+                repeatLengthMax = repeatLength;
+                repeatLengthMaxIndex = index;
+                if (258 <= repeatLength) {
+                    break;
+                }
+            }
+        }
+        if (repeatLengthMax >= 3 && nowIndex + repeatLengthMax <= endIndex) {
+            distance = nowIndex - repeatLengthMaxIndex;
+            for (let i = 0; i < LENGTH_EXTRA_BIT_BASE.length; i++) {
+                if (LENGTH_EXTRA_BIT_BASE[i] > repeatLengthMax) {
+                    break;
+                }
+                repeatLengthCodeValue = i;
+            }
+            for (let i = 0; i < DISTANCE_EXTRA_BIT_BASE.length; i++) {
+                if (DISTANCE_EXTRA_BIT_BASE[i] > distance) {
+                    break;
+                }
+                repeatDistanceCodeValue = i;
+            }
+            codeTargetValues.push([repeatLengthCodeValue, repeatDistanceCodeValue, repeatLengthMax, distance]);
+            nowIndex += repeatLengthMax;
+        } else {
+            codeTargetValues.push([input[nowIndex]]);
+            nowIndex++;
+        }
+    }
+    codeTargetValues.push([input[nowIndex]]);
+    codeTargetValues.push([input[nowIndex + 1]]);
+    return codeTargetValues;
+}
+
+/**
+ * @param {number[]} values 
+ * @param {number} maxLength 
+ * @returns 
+ */
+function generateDeflateHuffmanTable(values, maxLength = 15) {
+    const valuesCount = {};
+    for (const value of values) {
+        if (!valuesCount[value]) {
+            valuesCount[value] = 1;
+        } else {
+            valuesCount[value]++;
+        }
+    }
+    if (DEBUG) {
+        let fnd = {};
+        let m = 0;
+        debugLog += "valuesCount<br/>";
+        for (const key of values) {
+            if (!fnd[key]) {
+                debugLog += (key + "").padStart(3, '0') + ":" + (valuesCount[key] + "").padStart(4, '0') + " ";
+                fnd[key] = true;
+                if (m%16 == 15) {
+                    debugLog += "<br/>";
+                }
+                m++;
+            }
+        }
+        debugLog += "<br/>";
+    }
+
+    /** @type{Simble[]} */
+    let tmpPackages = [];
+    let tmpPackageIndex = 0;
+    /** @type{Simble[]} */
+    let packages = [];
+    const valuesCountKeys = Object.keys(valuesCount);
+    if (valuesCountKeys.length === 1) {
+        packages.push(new Simble(
+            valuesCount[0],
+            [Number(valuesCountKeys[0])]
+        ));
+    } else {
+        for (let i = 0; i < maxLength; i++) {
+            packages = [];
+            valuesCountKeys.forEach((value) => {
+                const pack = new Simble(
+                    valuesCount[Number(value)],
+                    [Number(value)]
+                );
+                packages.push(pack);
+            });
+            tmpPackageIndex = 0;
+            while (tmpPackageIndex + 2 <= tmpPackages.length) {
+                const pack = new Simble(
+                    tmpPackages[tmpPackageIndex].count + tmpPackages[tmpPackageIndex + 1].count,
+                    tmpPackages[tmpPackageIndex].simbles.concat(tmpPackages[tmpPackageIndex + 1].simbles)
+                );
+                packages.push(pack);
+                tmpPackageIndex += 2;
+            }
+            packages = packages.sort((a, b) => {
+                if (a.count < b.count) {
+                    return -1;
+                }
+                if (a.count > b.count) {
+                    return 1;
+                }
+                if (a.simbles.length < b.simbles.length) {
+                    return -1;
+                }
+                if (a.simbles.length > b.simbles.length) {
+                    return 1;
+                }
+                if (a.simbles[0] < b.simbles[0]) {
+                    return -1;
+                }
+                if (a.simbles[0] > b.simbles[0]) {
+                    return 1;
+                }
+                return 0;
+            });
+            if (packages.length % 2 !== 0) {
+                packages.pop();
+            }
+            tmpPackages = packages;
+        }
+    }
+    if (DEBUG) {
+        debugLog += "packages<br/>";
+        packages.forEach((pack) => {
+            debugLog += (pack.count + "").padStart(4, '0');
+            debugLog += ":[";
+            pack.simbles.forEach((symble) => {
+                debugLog += (symble + "").padStart(3, '0') + " ";
+            });
+            debugLog = debugLog.substring(0, debugLog.length-1);
+            debugLog += "]<br/>";
+        });
+        debugLog += "<br/>";
+    }
+
+    const valuesCodelen = {};
+    packages.forEach((pack) => {
+        pack.simbles.forEach((symble) => {
+            if (!valuesCodelen[symble]) {
+                valuesCodelen[symble] = 1;
+            } else {
+                valuesCodelen[symble]++;
+            }
+        });
+    });
+    let group;
+    const valuesCodelenKeys = Object.keys(valuesCodelen);
+    /** @type{Object} */
+    const codelenGroup = {};
+    let code = 0;
+    let codelen = 3;
+    let codelenValueMin = Number.MAX_SAFE_INTEGER;
+    let codelenValueMax = 0;
+    valuesCodelenKeys.forEach((valuesCodelenKey) => {
+        codelen = valuesCodelen[Number(valuesCodelenKey)];
+        if (!codelenGroup[codelen]) {
+            codelenGroup[codelen] = [];
+            if (codelenValueMin > codelen) {
+                codelenValueMin = codelen;
+            }
+            if (codelenValueMax < codelen) {
+                codelenValueMax = codelen;
+            }
+        }
+        codelenGroup[codelen].push(Number(valuesCodelenKey));
+    });
+    code = 0;
+    const table = new Map();
+    for (let i = codelenValueMin; i <= codelenValueMax; i++) {
+        group = codelenGroup[i];
+        if (group) {
+            group = group.sort((a, b) => {
+                if (a < b) {
+                    return -1;
+                }
+                if (a > b) {
+                    return 1;
+                }
+                return 0;
+            });
+            group.forEach((value) => {
+                table.set(value, { code, bitlen: i });
+                code++;
+            });
+        }
+        code <<= 1;
+    }
+    return table;
+}
+/**
+ * @param {BitWriteStream} stream 
+ * @param {Uint8Array} input 
+ * @param {number} startIndex 
+ * @param {number} targetLength 
+ */
+function deflateDynamicBlock(stream, input, startIndex, targetLength) {
+    const lz77Codes = generateLZ77Codes(input, startIndex, targetLength);
+    const clCodeValues = [256]; // character or matching length
+    const distanceCodeValues = [];
+    let clCodeValueMax = 256;
+    let distanceCodeValueMax = 0;
+    for (let i = 0, iMax = lz77Codes.length; i < iMax; i++) {
+        const values = lz77Codes[i];
+        let cl = values[0];
+        const distance = values[1];
+        if (distance !== undefined) {
+            cl += 257;
+            distanceCodeValues.push(distance);
+            if (distanceCodeValueMax < distance) {
+                distanceCodeValueMax = distance;
+            }
+        }
+        clCodeValues.push(cl);
+        if (clCodeValueMax < cl) {
+            clCodeValueMax = cl;
+        }
+    }
+    const dataHuffmanTables = generateDeflateHuffmanTable(clCodeValues);
+    const distanceHuffmanTables = generateDeflateHuffmanTable(distanceCodeValues);
+
+    if (DEBUG) {
+        debugLog += "clCodeValueMax:" + clCodeValueMax + "<br/>";
+        debugLog += dump(clCodeValues, true)+ "<br/><br/>";
+        debugLog += "distanceCodeValueMax:" + distanceCodeValueMax + "<br/>";
+        debugLog += dump(distanceCodeValues, true) + "<br/>";
+
+        debugLog += "dataHuffmanTables<br/>";
+        for(let m=0; m<dataHuffmanTables.size; m++) {
+            if (dataHuffmanTables.has(m)) {
+                let o = dataHuffmanTables.get(m);
+                debugLog += o.code + ":" + o.bitlen + " ";
+            }
+        }
+        debugLog += "<br/>";
+        debugLog += "distanceHuffmanTables<br/>";
+        for(let m=0; m<distanceHuffmanTables.size; m++) {
+            if (distanceHuffmanTables.has(m)) {
+                let o = distanceHuffmanTables.get(m);
+                debugLog += o.code + ":" + o.bitlen + " ";
+            }
+        }
+        debugLog += "<br/>";
+    }
+
+    /** @type{number[]} */
+    const codelens = [];
+    for (let i = 0; i <= clCodeValueMax; i++) {
+        if (dataHuffmanTables.has(i)) {
+            codelens.push(dataHuffmanTables.get(i).bitlen);
+        } else {
+            codelens.push(0);
+        }
+    }
+    const HLIT = codelens.length;
+    for (let i = 0; i <= distanceCodeValueMax; i++) {
+        if (distanceHuffmanTables.has(i)) {
+            codelens.push(distanceHuffmanTables.get(i).bitlen);
+        } else {
+            codelens.push(0);
+        }
+    }
+    const HDIST = codelens.length - HLIT;
+    /** @type{number[]} */
+    const runLengthCodes = [];
+    /** @type{number[]} */
+    const runLengthRepeatCount = [];
+    let codelen = 0;
+    let repeatLength = 0;
+    for (let i = 0; i < codelens.length; i++) {
+        codelen = codelens[i];
+        repeatLength = 1;
+        while ((i + 1) < codelens.length && codelen === codelens[i + 1]) {
+            repeatLength++;
+            i++;
+            if (codelen === 0) {
+                if (138 <= repeatLength) {
+                    break;
+                }
+            } else {
+                if (6 <= repeatLength) {
+                    break;
+                }
+            }
+        }
+        if (4 <= repeatLength) {
+            if (codelen === 0) {
+                if (11 <= repeatLength) {
+                    runLengthCodes.push(18);
+                } else {
+                    runLengthCodes.push(17);
+                }
+            } else {
+                runLengthCodes.push(codelen);
+                runLengthRepeatCount.push(1);
+                repeatLength--;
+                runLengthCodes.push(16);
+            }
+            runLengthRepeatCount.push(repeatLength);
+        } else {
+            for (let j = 0; j < repeatLength; j++) {
+                runLengthCodes.push(codelen);
+                runLengthRepeatCount.push(1);
+            }
+        }
+    }
+    const codelenHuffmanTable = generateDeflateHuffmanTable(runLengthCodes, 7);
+    let HCLEN = 0;
+    CODELEN_VALUES.forEach((value, index) => {
+        if (codelenHuffmanTable.has(value)) {
+            HCLEN = index + 1;
+        }
+    });
+    // HLIT
+    stream.writeRange(HLIT - 257, 5);
+    // HDIST
+    stream.writeRange(HDIST - 1, 5);
+    // HCLEN
+    stream.writeRange(HCLEN - 4, 4);
+    let codelenTableObj;
+    // codelenHuffmanTable
+    for (let i = 0; i < HCLEN; i++) {
+        codelenTableObj = codelenHuffmanTable.get(CODELEN_VALUES[i]);
+        if (codelenTableObj !== undefined) {
+            stream.writeRange(codelenTableObj.bitlen, 3);
+        }
+        else {
+            stream.writeRange(0, 3);
+        }
+    }
+    runLengthCodes.forEach((value, index) => {
+        codelenTableObj = codelenHuffmanTable.get(value);
+        if (codelenTableObj !== undefined) {
+            stream.writeRangeCoded(codelenTableObj.code, codelenTableObj.bitlen);
+        } else {
+            throw new Error('Data is corrupted');
+        }
+        if (value === 18) {
+            stream.writeRange(runLengthRepeatCount[index] - 11, 7);
+        }
+        else if (value === 17) {
+            stream.writeRange(runLengthRepeatCount[index] - 3, 3);
+        }
+        else if (value === 16) {
+            stream.writeRange(runLengthRepeatCount[index] - 3, 2);
+        }
+    });
+    for (let i = 0, iMax = lz77Codes.length; i < iMax; i++) {
+        const values = lz77Codes[i];
+        const clCodeValue = values[0];
+        const distanceCodeValue = values[1];
+        if (distanceCodeValue !== undefined) {
+            codelenTableObj = dataHuffmanTables.get(clCodeValue + 257);
+            if (codelenTableObj === undefined) {
+                throw new Error('Data is corrupted');
+            }
+            stream.writeRangeCoded(codelenTableObj.code, codelenTableObj.bitlen);
+            if (0 < LENGTH_EXTRA_BIT_LEN[clCodeValue]) {
+                repeatLength = values[2];
+                stream.writeRange(repeatLength - LENGTH_EXTRA_BIT_BASE[clCodeValue], LENGTH_EXTRA_BIT_LEN[clCodeValue]);
+            }
+            const distanceTableObj = distanceHuffmanTables.get(distanceCodeValue);
+            if (distanceTableObj === undefined) {
+                throw new Error('Data is corrupted');
+            }
+            stream.writeRangeCoded(distanceTableObj.code, distanceTableObj.bitlen);
+            if (0 < DISTANCE_EXTRA_BIT_LEN[distanceCodeValue]) {
+                const distance = values[3];
+                stream.writeRange(distance - DISTANCE_EXTRA_BIT_BASE[distanceCodeValue], DISTANCE_EXTRA_BIT_LEN[distanceCodeValue]);
+            }
+        } else {
+            codelenTableObj = dataHuffmanTables.get(clCodeValue);
+            if (codelenTableObj === undefined) {
+                throw new Error('Data is corrupted');
+            }
+            stream.writeRangeCoded(codelenTableObj.code, codelenTableObj.bitlen);
+        }
+    }
+    codelenTableObj = dataHuffmanTables.get(256);
+    if (codelenTableObj === undefined) {
+        throw new Error('Data is corrupted');
+    }
+    stream.writeRangeCoded(codelenTableObj.code, codelenTableObj.bitlen);
+}
+/**
+ * @param {Uint8Array} input 
+ * @returns {Uint8Array}
+ */
+function deflate(input) {
+    const inputLength = input.length;
+    const streamHeap = (inputLength < BLOCK_MAX_BUFFER_LEN / 2) ? BLOCK_MAX_BUFFER_LEN : inputLength * 2;
+    const stream = new BitWriteStream(new Uint8Array(streamHeap));
+    let processedLength = 0;
+    let targetLength = 0;
+    while (true) {
+        if (processedLength + BLOCK_MAX_BUFFER_LEN >= inputLength) {
+            targetLength = inputLength - processedLength;
+            stream.writeRange(1, 1);
+        } else {
+            targetLength = BLOCK_MAX_BUFFER_LEN;
+            stream.writeRange(0, 1);
+        }
+        stream.writeRange(BTYPE.DYNAMIC, 2);
+        deflateDynamicBlock(stream, input, processedLength, targetLength);
+        processedLength += BLOCK_MAX_BUFFER_LEN;
+        if (processedLength >= inputLength) {
+            break;
+        }
+    }
+    if (stream.nowBitsIndex !== 0) {
+        stream.writeRange(0, 8 - stream.nowBitsIndex);
+    }
+    return stream.buffer.subarray(0, stream.bufferIndex);
+}
+
+let arr = new Uint8Array([
+    42,32,32,32,
+    32,32,32,84,
+    10,10,32,109,
+    111,115,116,32,
+    
+    115,116,114,97,
+    105,103,104,116,
+    102,111,114,119,
+    97,114,100,32,
+    
+    116,101,99,104,
+    110,105,113,117,
+    101,32,116,117,
+    114,110,115,32,
+    
+    111,117,116,32,
+    116,111,32,98,
+    101,32,116,104,
+    101,32,102,97,
+    
+    115,116,101,115,
+    116,32,102,111,
+    114,13,10,32,
+    42,32,32,32,
+    
+    32,32,32,109,
+    111,115,116,32,
+    105,110,112,117,
+    116,32,102,105,
+    
+    108,101,115,58,
+    32,116,114,121,
+    32,97,108,108,
+    32,112,111,115,
+    
+    115,105,98,108,
+    101,32,109,97,
+    116,99,104,101,
+    115,32,97,110,
+    
+    100,32,115,101,
+    108,101,99,116,
+    32,116,104,101,
+    32,108,111,110,
+    
+    103,101,115,116,
+    46,13,10,32,
+    42,32,32,32,
+    32,32,32,84,
+    
+    104,101,32,107,
+    101,121,32,102,
+    101,97,116,117,
+    114,101,32,111,
+    
+    102,32,116,104,
+    105,115,32,97,
+    108,103,111,114,
+    105,116,104,109,
+    
+    32,105,115,32,
+    116,104,97,116,
+    32,105,110,115,
+    101,114,116,105,
+    
+    111,110,115,32,
+    105,110,116,111,
+    32,116,104,101,
+    32,115,116,114,
+    
+    105,110,103,13,
+    10,32,42,32,
+    32,32,32,32,
+    32,100,105,99,
+    
+    116,105,111,110,
+    97,114,121,32,
+    97,114,101,32,
+    118,101,114,121,
+    
+    32,115,105,109,
+    112,108,101,32,
+    97,110,100,32,
+    116,104,117,115,
+    
+    32,102,97,115,
+    116,44,32,97,
+    110,100,32,100,
+    101,108,101,116,
+    
+    105,111,110,115,
+    32,97,114,101,
+    32,97,118,111,
+    105,100,101,100,
+    
+    13,10,32,42,
+    32,32,32,32,
+    32,32,99,111,
+    109,112,108,101,
+    
+    116,101,108,121,
+    46,32,73,110,
+    115,101,114,116,
+    105,111,110,115,
+    
+    32,97,114,101,
+    32,112,101,114,
+    102,111,114,109,
+    101,100,32,97,
+    
+    116,32,101,97,
+    99,104,32,105,
+    110,112,117,116,
+    32,99,104,97,
+    
+    114,97,99,116,
+    101,114,44,32,
+    119,104,101,114,
+    101,97,115,13,
+    
+    10,32,42,32,
+    32,32,32,32,
+    32,115,116,114,
+    105,110,103,32,
+    
+    109,97,116,99,
+    104,101,115,32,
+    97,114,101,32,
+    112,101,114,102,
+    
+    111,114,109,101,
+    100,32,111,110,
+    108,121,32,119,
+    104,101,110,32,
+    
+    116,104,101,32,
+    112,114,101,118,
+    105,111,117,115,
+    32,109,97,116,
+    
+    99,104,32,101,
+    110,100,115,46,
+    32,83,111,32,
+    105,116,13,10,
+    
+    32,42,32,32,
+    32,32,32,32,
+    105,115,32,112,
+    114,101,102,101,
+    
+    114,97,98,108,
+    101,32,116,111,
+    32,115,112,101,
+    110,100,32,109,
+    
+    111,114,101,32,
+    116,105,109,101,
+    32,105,110,32,
+    109,97,116,99,
+    
+    104,101,115,32,
+    116,111,32,97,
+    108,108,111,119,
+    32,118,101,114,
+    
+    121,32,102,97,
+    115,116,32,115,
+    116,114,105,110,
+    103,13,10,32,
+    
+    42,32,32,32,32,32,32,105,110,115,101,114,116,105,111,110,115,32,97,110,100,32,97,118,111,105,100,32,100,101,108,101,116,105,111,110,115,46,32,84,104,101,32,109,97,116,99,104,105,110,103,32,97,108,103,111,114,105,116,104,109,32,102,111,114,32,115,109,97,108,108,13,10,32,42,32,32,32,32,32,32,115,116,114,105,110,103,115,32,105,115,32,105,110,115,112,105,114,101,100,32,102,114,111,109,32,116,104,97,116,32,111,102,32,82,97,98,105,110,32,38,32,75,97,114,112,46,32,65,32,98,114,117,116,101,32,102,111,114,99,101,32,97,112,112,114,111,97,99,104,13,10,32,42,32,32,32,32,32,32,105,115,32,117,115,101,100,32,116,111,32,102,105,110,100,32,108,111,110,103,101,114,32,115,116,114,105,110,103,115,32,119,104,101,110,32,97,32,115,109,97,108,108,32,109,97,116,99,104,32,104,97,115,32,98,101,101,110,32,102,111,117,110,100,46,13,10,32,42,32,32,32,32,32,32,65,32,115,105,109,105,108,97,114,32,97,108,103,111,114,105,116,104,109,32,105,115,32,117,115,101,100,32,105,110,32,99,111,109,105,99,32,40,98,121,32,74,97,110,45,77,97,114,107,32,87,97,109,115,41,32,97,110,100,32,102,114,101,101,122,101,13,10,32,42,32,32,32,32,32,32,40,98,121,32,76,101,111,110,105,100,32,66,114,111,117,107,104,105,115,41,46,13,10,32,42,32,32,32,32,32,32,32,32,32,65,32,112,114,101,118,105,111,117,115,32,118,101,114,115,105,111,110,32,111,102,32,116,104,105,115,32,102,105,108,101,32,117,115,101,100,32,97,32,109,111,114,101,32,115,111,112,104,105,115,116,105,99,97,116,101,100,32,97,108,103,111,114,105,116,104,109,13,10,32,42,32,32,32,32,32,32,40,98,121,32,70,105,97,108,97,32,97,110,100,32,71,114,101,101,110,101,41,32,119,104,105,99,104,32,105,115,32,103,117,97,114,97,110,116,101,101,100,32,116,111,32,114,117,110,32,105,110,32,108,105,110,101,97,114,32,97,109,111,114,116,105,122,101,100,13,10,32,42,32,32,32,32,32,32,116,105,109,101,44,32,98,117,116,32,104,97,115,32,97,32,108,97,114,103,101,114,32,97,118,101,114,97,103,101,32,99,111,115,116,44,32,117,115,101,115,32,109,111,114,101,32,109,101,109,111,114,121,32,97,110,100,32,105,115,32,112,97,116,101,110,116,101,100,46,13,10,32,42,32,32,32,32,32,32,72,111,119,101,118,101,114,32,116,104,101,32,70,38,71,32,97,108,103,111,114,105,116,104,109,32,109,97,121,32,98,101,32,102,97,115,116,101,114,32,102,111,114,32,115,111,109,101,32,104,105,103,104,108,121,32,114,101,100,117,110,100,97,110,116,13,10,32,42,32,32,32,32,32,32,102,105,108,101,115,32,105,102,32,116,104,101,32,112,97,114,97,109,101,116,101,114,32,109,97,120,95,99,104,97,105,110,95,108,101,110,103,116,104,32,40,100,101,115,99,114,105,98,101,100,32,98,101,108,111,119,41,32,105,115,32,116,111,111,32,108,97,114,103,101,46
+]);
+let comp = deflate(arr);
+
+document.getElementById("lblDisp").innerHTML = dump(comp);
+if ("" != debugLog) {
+    document.getElementById("lblDisp").innerHTML
+        = debugLog + "<br/>"
+        + document.getElementById("lblDisp").innerHTML;
+}
+
+</script>
